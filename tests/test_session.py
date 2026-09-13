@@ -6,12 +6,14 @@ import tempfile
 import threading
 import time
 import unittest
+from dataclasses import FrozenInstanceError
 from pathlib import Path
 from types import SimpleNamespace
 
 from pychromecast.config import APP_MEDIA_RECEIVER
 
 from castlib.session import CastSession, SessionState
+from castlib.streaming import EncodeProgress
 
 
 class FakeCast:
@@ -218,6 +220,70 @@ class TakingOverTheDevice(unittest.TestCase):
         session = silent_session()
 
         self.assertEqual(session.running_app(SimpleNamespace(status=None)), "")
+
+
+ENCODING = EncodeProgress(fps=29.7, speed=0.99, dropped=2, duplicated=41)
+
+
+class Statistics(unittest.TestCase):
+    """The window watches these while a cast runs; the CLI ignores them."""
+
+    def snapshot(self, capture: object = None, rebuffers: int = 0) -> object:
+        return CastSession._snapshot(
+            elapsed=95.4,
+            progress=ENCODING,
+            bitrate_kbps=5904.2,
+            capture=capture,
+            rebuffers=rebuffers,
+        )
+
+    def test_there_is_nothing_to_report_before_a_cast(self) -> None:
+        self.assertIsNone(silent_session().stats)
+
+    def test_carries_what_ffmpeg_reported(self) -> None:
+        stats = self.snapshot()
+
+        self.assertAlmostEqual(stats.fps, 29.7)
+        self.assertAlmostEqual(stats.speed, 0.99)
+        self.assertEqual(stats.dropped, 2)
+        self.assertEqual(stats.duplicated, 41)
+
+    def test_carries_the_measured_bitrate_and_the_clock(self) -> None:
+        stats = self.snapshot()
+
+        self.assertAlmostEqual(stats.bitrate_kbps, 5904.2)
+        self.assertAlmostEqual(stats.elapsed, 95.4)
+
+    def test_carries_the_rebuffer_count(self) -> None:
+        self.assertEqual(self.snapshot(rebuffers=3).rebuffers, 3)
+
+    def test_no_system_audio_is_not_the_same_as_silence(self) -> None:
+        """A missing level has to read as "off", not as "0 dB"."""
+        self.assertIsNone(self.snapshot().audio_peak_dbfs)
+
+    def test_the_level_comes_from_the_capture(self) -> None:
+        capture = SimpleNamespace(peak_dbfs=-12.5)
+
+        self.assertAlmostEqual(self.snapshot(capture).audio_peak_dbfs, -12.5)
+
+    def test_a_snapshot_cannot_be_edited_from_under_a_reader(self) -> None:
+        """The window reads these off the Tk thread while the monitor
+        writes them; a whole frozen object swapped in is what makes
+        that safe without a lock."""
+        with self.assertRaises(FrozenInstanceError):
+            self.snapshot().fps = 1.0
+
+    def test_starting_again_drops_the_previous_cast(self) -> None:
+        from castlib.session import CastOptions
+
+        session = silent_session()
+        session._stats = self.snapshot()
+        session._run = lambda options: None
+
+        session.start(CastOptions())
+        session.stop()
+
+        self.assertIsNone(session.stats)
 
 
 class Lifecycle(unittest.TestCase):

@@ -16,8 +16,8 @@ def pump(root: tk.Tk, times: int = 25) -> None:
         root.update()
 
 
-def real_position(window: tk.Misc) -> tuple[int, int]:
-    """Ask Windows where a window actually is.
+def window_rect(window: tk.Misc) -> wintypes.RECT:
+    """Ask Windows where a window actually is and how big it actually is.
 
     Tk reports the geometry it was asked for, not the geometry it got:
     a frameless Toplevel can sit at 0,0 while winfo_rootx() insists it
@@ -31,7 +31,19 @@ def real_position(window: tk.Misc) -> tuple[int, int]:
     rect = wintypes.RECT()
     user32.GetWindowRect(handle, ctypes.byref(rect))
 
+    return rect
+
+
+def real_position(window: tk.Misc) -> tuple[int, int]:
+    rect = window_rect(window)
+
     return rect.left, rect.top
+
+
+def real_size(window: tk.Misc) -> tuple[int, int]:
+    rect = window_rect(window)
+
+    return rect.right - rect.left, rect.bottom - rect.top
 
 
 class DropdownPopup(unittest.TestCase):
@@ -139,6 +151,70 @@ class DropdownPopup(unittest.TestCase):
         pump(self.root)
 
         self.assertIsNone(self.dropdown._popup)
+
+
+class WindowResizing(unittest.TestCase):
+    """The stats panel is only worth packing if the window makes room.
+
+    A frameless window has no OS chrome to negotiate the change with,
+    so this is asserted against what Windows says the window became,
+    not against the geometry Tk was handed.
+    """
+
+    WIDTH = 300
+    HEIGHT = 200
+    TALLER = 280
+
+    def setUp(self) -> None:
+        self.window = win98.AppWindow("Resize test", self.WIDTH, self.HEIGHT)
+
+        pump(self.window.root)
+
+    def tearDown(self) -> None:
+        self.window.root.destroy()
+
+    def test_growing_reaches_the_real_window(self) -> None:
+        self.window.resize(self.WIDTH, self.TALLER)
+
+        pump(self.window.root)
+
+        width, height = real_size(self.window.root)
+
+        self.assertAlmostEqual(width, win98.scale(self.WIDTH), delta=2)
+        self.assertAlmostEqual(height, win98.scale(self.TALLER), delta=2)
+
+    def test_shrinking_puts_it_back(self) -> None:
+        self.window.resize(self.WIDTH, self.TALLER)
+        pump(self.window.root)
+
+        self.window.resize(self.WIDTH, self.HEIGHT)
+        pump(self.window.root)
+
+        _, height = real_size(self.window.root)
+
+        self.assertAlmostEqual(height, win98.scale(self.HEIGHT), delta=2)
+
+    def test_resizing_does_not_move_the_window(self) -> None:
+        """Growing must not also teleport the window back to centre."""
+        self.window.root.geometry("+220+140")
+        pump(self.window.root)
+
+        before = real_position(self.window.root)
+
+        self.window.resize(self.WIDTH, self.TALLER)
+        pump(self.window.root)
+
+        self.assertEqual(real_position(self.window.root), before)
+
+    def test_the_body_grows_with_it(self) -> None:
+        """A window that reports the new size but does not re-lay-out
+        would show the panel over the top of the controls."""
+        before = self.window.body.winfo_height()
+
+        self.window.resize(self.WIDTH, self.TALLER)
+        pump(self.window.root)
+
+        self.assertGreater(self.window.body.winfo_height(), before)
 
 
 class Scaling(unittest.TestCase):

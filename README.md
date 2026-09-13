@@ -132,6 +132,36 @@ The AMD encoder scored within noise of x264 at the same bitrate (SSIM
 0.979 vs 0.977, PSNR 32.16 vs 32.53), so it buys nothing while adding a
 GPU dependency. Bitrate and capture rate are the levers, not the preset.
 
+## Watching it run
+
+While a cast is running the window grows a **Stats** panel:
+
+```
+30.0 fps at 1.00x, 5.9 Mbps
+0 frames dropped, 12 duplicated
+4:21, 0 rebuffers, peak -12 dB
+```
+
+The two worth watching are **speed** and **duplicated frames**. Speed is
+how fast ffmpeg is encoding against the wall clock — 1.00x is holding
+real time, and anything below it means the encode is falling behind for
+as long as it stays there. Climbing duplicates mean capture is
+delivering fewer frames than the 30 being encoded, which is the gdigrab
+symptom above: the output claims 30fps while the motion is half that.
+
+The bitrate is weighed from the segments in the playlist rather than
+asked of ffmpeg, which reports none for a segmented output — it has no
+single file to measure. That makes it the rate the device is actually
+being asked to pull, so it sits well under the **Quality** setting on a
+still desktop and climbs towards it on moving video.
+
+**Rebuffers** is the same count behind the warning after four of them.
+**Peak** is the loudest the captured audio has been, which is the
+quickest way to catch the muted-endpoint trap at the top of this file:
+`no sound` there means loopback is capturing digital silence.
+
+The panel is the window only. The command line ignores it.
+
 ## Delay
 
 Pick **Delay** in the window, or `--delay` on the command line.

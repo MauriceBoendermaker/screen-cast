@@ -17,6 +17,8 @@ from castlib.streaming import (
     StreamSettings,
     build_ffmpeg_command,
     clean_stale_directories,
+    measured_bitrate_kbps,
+    parse_progress,
 )
 
 
@@ -409,6 +411,196 @@ class Preroll(unittest.TestCase):
 
     def test_preroll_is_deep_enough_to_matter(self) -> None:
         self.assertGreaterEqual(streaming.PREROLL_SEGMENTS, 3)
+
+
+# Captured from ffmpeg 8.1 writing HLS. Two things worth keeping: the
+# speed value arrives padded, and bitrate is N/A because an HLS output
+# is a stream of files with no single size to divide.
+PROGRESS = """\
+frame=45
+fps=0.00
+stream_0_0_q=-1.0
+bitrate=N/A
+total_size=N/A
+out_time_us=1500000
+out_time_ms=1500000
+out_time=00:00:01.500000
+dup_frames=0
+drop_frames=0
+speed=1.99x
+progress=continue
+frame=105
+fps=29.94
+stream_0_0_q=28.0
+bitrate=N/A
+total_size=N/A
+out_time_us=3500000
+out_time_ms=3500000
+out_time=00:00:03.500000
+dup_frames=7
+drop_frames=2
+speed=  1.1x
+progress=continue
+"""
+
+
+class Progress(unittest.TestCase):
+    """Parsing what ffmpeg says about itself, no process required."""
+
+    def setUp(self) -> None:
+        self.progress = parse_progress(PROGRESS)
+
+    def test_the_command_asks_ffmpeg_to_report(self) -> None:
+        command = build_ffmpeg_command(settings())
+
+        self.assertEqual(argument_after(command, "-progress"), "pipe:1")
+
+    def test_reads_the_frame_rate(self) -> None:
+        self.assertAlmostEqual(self.progress.fps, 29.94)
+
+    def test_reads_the_speed_through_its_padding(self) -> None:
+        self.assertAlmostEqual(self.progress.speed, 1.1)
+
+    def test_counts_frames_thrown_away(self) -> None:
+        self.assertEqual(self.progress.dropped, 2)
+        self.assertEqual(self.progress.duplicated, 7)
+
+    def test_the_last_block_wins(self) -> None:
+        """The first block reported 0.00 fps and nothing dropped."""
+        self.assertNotAlmostEqual(self.progress.fps, 0.0)
+
+    def test_a_half_written_block_is_ignored(self) -> None:
+        """A read can land mid-block, and mixing halves of two blocks
+        would report a frame rate against the wrong frame count."""
+        torn = parse_progress(PROGRESS + "frame=200\nfps=99.00\ndup_frames=99\n")
+
+        self.assertAlmostEqual(torn.fps, 29.94)
+        self.assertEqual(torn.duplicated, 7)
+
+    def test_nothing_yet_reads_as_zero_not_a_crash(self) -> None:
+        self.assertEqual(parse_progress(""), streaming.EncodeProgress())
+
+    def test_a_value_ffmpeg_cannot_answer_keeps_the_last_known(self) -> None:
+        """N/A means "not worked out yet", not "it is zero"."""
+        later = parse_progress(
+            PROGRESS + "frame=200\nfps=N/A\ndup_frames=9\nprogress=continue\n"
+        )
+
+        self.assertAlmostEqual(later.fps, 29.94)
+        self.assertEqual(later.duplicated, 9)
+
+    def test_the_closing_block_still_counts(self) -> None:
+        ended = parse_progress(PROGRESS.replace("progress=continue", "progress=end"))
+
+        self.assertAlmostEqual(ended.fps, 29.94)
+
+
+class ProgressReader(unittest.TestCase):
+    """The reader owns the pipe it is handed, teardown included."""
+
+    def setUp(self) -> None:
+        read, self.write = os.pipe()
+
+        self.source = os.fdopen(read, "rb")
+        self.progress = streaming.FfmpegProgress()
+
+    def tearDown(self) -> None:
+        # Let go of the write end first, so a reader left blocked by the
+        # test above reaches EOF and the rest of this can finish.
+        try:
+            os.close(self.write)
+        except OSError:
+            pass
+
+        self.progress.stop()
+        self.source.close()
+
+    def test_picks_up_blocks_as_they_arrive(self) -> None:
+        self.progress.start(self.source)
+
+        os.write(self.write, PROGRESS.encode())
+        os.close(self.write)
+
+        self.progress.stop()
+
+        self.assertAlmostEqual(self.progress.latest.fps, 29.94)
+        self.assertEqual(self.progress.latest.duplicated, 7)
+
+    def test_nothing_read_yet_is_still_a_usable_answer(self) -> None:
+        self.assertEqual(self.progress.latest, streaming.EncodeProgress())
+
+    def test_stop_without_a_start_does_nothing(self) -> None:
+        self.progress.stop()
+
+    def test_stop_does_not_wait_out_a_reader_still_stuck_on_the_pipe(self) -> None:
+        """A killed ffmpeg dies asynchronously on Windows, so the read
+        can outlive it. Closing the pipe under the blocked reader would
+        wait for the process too — and Stop is what someone presses
+        when they have had enough of waiting."""
+        self.progress.start(self.source)
+
+        started = time.monotonic()
+        self.progress.stop()
+        elapsed = time.monotonic() - started
+
+        self.assertLess(elapsed, 4.0, "stop() blocked on the wedged reader")
+        self.assertFalse(self.source.closed, "closing it would have hung")
+
+
+class MeasuredBitrate(unittest.TestCase):
+    """ffmpeg answers bitrate=N/A for an HLS output, every block, for as
+    long as the cast runs: it is writing a stream of files rather than
+    one, so it has no total size to divide. The segments themselves are
+    the only honest source, and the better one — they are what the
+    device is actually being asked to pull."""
+
+    def setUp(self) -> None:
+        self.directory = Path(tempfile.mkdtemp(prefix="bitrate-"))
+
+    def tearDown(self) -> None:
+        shutil.rmtree(self.directory, ignore_errors=True)
+
+    def write_playlist(self, segments: list[tuple[float, int]]) -> None:
+        lines = ["#EXTM3U", "#EXT-X-VERSION:3", "#EXT-X-TARGETDURATION:2"]
+
+        for index, (duration, size) in enumerate(segments):
+            name = f"segment_{index:05d}.ts"
+
+            (self.directory / name).write_bytes(bytes(size))
+
+            lines += [f"#EXTINF:{duration:.6f},", name]
+
+        (self.directory / "live.m3u8").write_text(
+            "\n".join(lines), encoding="utf-8"
+        )
+
+    def test_weighs_the_listed_segments(self) -> None:
+        # 150,000 bytes across two seconds is 600 kbit/s.
+        self.write_playlist([(2.0, 150_000)])
+
+        self.assertAlmostEqual(measured_bitrate_kbps(self.directory), 600.0)
+
+    def test_averages_across_the_playlist(self) -> None:
+        self.write_playlist([(2.0, 150_000), (2.0, 50_000)])
+
+        self.assertAlmostEqual(measured_bitrate_kbps(self.directory), 400.0)
+
+    def test_a_segment_rotated_away_is_left_out_of_both_halves(self) -> None:
+        """Counting its duration but not its bytes would report a
+        collapse in bitrate every time a segment aged out."""
+        self.write_playlist([(2.0, 150_000), (2.0, 50_000)])
+
+        (self.directory / "segment_00000.ts").unlink()
+
+        self.assertAlmostEqual(measured_bitrate_kbps(self.directory), 200.0)
+
+    def test_a_missing_playlist_is_not_an_error(self) -> None:
+        self.assertEqual(measured_bitrate_kbps(self.directory), 0.0)
+
+    def test_a_playlist_with_no_segments_yet_is_zero(self) -> None:
+        (self.directory / "live.m3u8").write_text("#EXTM3U\n", encoding="utf-8")
+
+        self.assertEqual(measured_bitrate_kbps(self.directory), 0.0)
 
 
 class StaleDirectories(unittest.TestCase):

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ctypes
+import re
 import shutil
 import subprocess
 import sys
@@ -14,6 +15,7 @@ from dataclasses import dataclass
 from functools import partial
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from typing import BinaryIO
 
 from castlib.audio import (
     FFMPEG_SAMPLE_FORMAT,
@@ -206,6 +208,12 @@ def build_ffmpeg_command(settings: StreamSettings) -> list[str]:
         "-loglevel",
         "warning",
         "-y",
+        # ffmpeg already knows its frame rate, how far ahead of real
+        # time it is running and how many frames it threw away; it just
+        # has to be asked. The report goes to stdout, which the HLS
+        # muxer does not use, so it cannot disturb the stream.
+        "-progress",
+        "pipe:1",
         "-thread_queue_size",
         THREAD_QUEUE_SIZE,
     ]
@@ -354,6 +362,156 @@ def build_ffmpeg_command(settings: StreamSettings) -> list[str]:
     return command
 
 
+@dataclass(frozen=True)
+class EncodeProgress:
+    """The last thing ffmpeg said about how the encode is going.
+
+    Only what ffmpeg can actually answer for an HLS output. It reports
+    no bitrate here — it is writing a stream of files rather than one,
+    so it has no total size to divide, and every block says N/A.
+    measured_bitrate_kbps() weighs the segments instead.
+    """
+
+    fps: float = 0.0
+    speed: float = 0.0
+    dropped: int = 0
+    duplicated: int = 0
+
+
+# Values arrive with their unit attached, and sometimes padded:
+# "speed=1.02x", "speed=  83x".
+_NUMBER = re.compile(r"-?\d+(?:\.\d+)?")
+
+# Nothing is worked out yet in the first block or two, and ffmpeg says
+# so rather than guessing.
+_UNKNOWN = "N/A"
+
+
+def _decimal(value: str | None) -> float:
+    match = _NUMBER.search(value) if value else None
+
+    return float(match.group()) if match else 0.0
+
+
+def _whole(value: str | None) -> int:
+    return int(_decimal(value))
+
+
+def parse_progress(text: str) -> EncodeProgress:
+    """Read the last complete block of ffmpeg's -progress output.
+
+    Kept pure so sample ffmpeg text can be handed straight to it, no
+    process required. Two things the caller would otherwise get wrong:
+    a block only counts once its closing progress= line arrives, so a
+    half-written one at the end is ignored rather than mixed into the
+    figures before it, and a value ffmpeg has not worked out yet keeps
+    whatever was last known instead of reading as a real zero.
+    """
+    known: dict[str, str] = {}
+    latest = EncodeProgress()
+
+    for line in text.splitlines():
+        key, separator, value = line.partition("=")
+
+        if not separator:
+            continue
+
+        key = key.strip()
+        value = value.strip()
+
+        if key == "progress":
+            latest = EncodeProgress(
+                fps=_decimal(known.get("fps")),
+                speed=_decimal(known.get("speed")),
+                dropped=_whole(known.get("drop_frames")),
+                duplicated=_whole(known.get("dup_frames")),
+            )
+        elif value and value != _UNKNOWN:
+            known[key] = value
+
+    return latest
+
+
+class FfmpegProgress:
+    """Reads ffmpeg's own account of the encode off a background thread.
+
+    The pipe is drained whether or not anyone is looking at the numbers.
+    A Windows pipe holds about 4KB, which is some eleven seconds of
+    progress blocks; ffmpeg itself shrugs that off and keeps encoding at
+    real time indefinitely (measured over four minutes, segments still
+    landing on the half second), but everything after the block that
+    filled the pipe is lost. A reader started late, or not at all, would
+    therefore leave the numbers frozen at the eleven second mark,
+    looking perfectly plausible and never changing again.
+    """
+
+    def __init__(self) -> None:
+        self._source: BinaryIO | None = None
+        self._reader: threading.Thread | None = None
+
+        self.latest = EncodeProgress()
+
+    def start(self, source: BinaryIO | None) -> None:
+        if source is None:
+            return
+
+        self._source = source
+
+        self._reader = threading.Thread(
+            target=self._read,
+            args=(source,),
+            daemon=True,
+        )
+
+        self._reader.start()
+
+    def _read(self, source: BinaryIO) -> None:
+        block: list[str] = []
+
+        try:
+            for raw in source:
+                line = raw.decode("utf-8", "replace")
+
+                block.append(line)
+
+                if line.startswith("progress="):
+                    self.latest = parse_progress("".join(block))
+
+                    block = []
+        except (OSError, ValueError):
+            # ffmpeg going away closes the pipe under us. Its exit code
+            # is what reports that, not a broken read here.
+            pass
+
+    def stop(self) -> None:
+        """Join the reader, then close the pipe it was reading.
+
+        Only ffmpeg exiting ends that read, so this has to run after the
+        process is gone. And if the reader is somehow still in it — a
+        killed ffmpeg dies asynchronously on Windows and can outlive its
+        own kill() — the pipe is deliberately left open. Closing it
+        needs the same lock the blocked read is holding, so the close
+        would not return until ffmpeg finally died, which is Stop
+        hanging on the very thing it was trying to give up on.
+        """
+        reader, source = self._reader, self._source
+
+        self._reader = None
+        self._source = None
+
+        if reader is not None:
+            reader.join(timeout=2)
+
+            if reader.is_alive():
+                return
+
+        if source is not None:
+            try:
+                source.close()
+            except OSError:
+                pass
+
+
 class _IoCounters(ctypes.Structure):
     _fields_ = [
         ("ReadOperationCount", ctypes.c_ulonglong),
@@ -451,9 +609,12 @@ def _contain(process: subprocess.Popen) -> None:
 def start_ffmpeg(settings: StreamSettings) -> subprocess.Popen:
     command = build_ffmpeg_command(settings)
 
+    # Binary throughout, deliberately. Text mode would apply to stdin as
+    # well, and stdin carries raw PCM.
     process = subprocess.Popen(
         command,
         stdin=subprocess.PIPE if settings.has_system_audio else subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
         creationflags=_no_window_flag(),
     )
 
@@ -477,6 +638,46 @@ def listed_segments(directory: Path) -> int:
         return 0
 
     return sum(1 for line in playlist.splitlines() if line.strip().endswith(".ts"))
+
+
+def measured_bitrate_kbps(directory: Path) -> float:
+    """What the published segments actually weigh, in kbit/s.
+
+    ffmpeg will not answer this for an HLS output, but the playlist is
+    the better source anyway: it holds exactly the segments a player is
+    being offered, each with its own duration, so this is the rate the
+    device is really being asked to pull rather than the rate the
+    encoder was aimed at.
+    """
+    try:
+        playlist = (directory / PLAYLIST_NAME).read_text()
+    except OSError:
+        return 0.0
+
+    total = 0
+    seconds = 0.0
+    duration = 0.0
+
+    for line in playlist.splitlines():
+        line = line.strip()
+
+        if line.startswith("#EXTINF:"):
+            duration = _decimal(line)
+        elif duration and line.endswith(".ts"):
+            try:
+                total += (directory / line).stat().st_size
+            except OSError:
+                # Rotated out between reading the playlist and here.
+                pass
+            else:
+                seconds += duration
+
+            duration = 0.0
+
+    if seconds <= 0:
+        return 0.0
+
+    return total * 8 / seconds / 1000
 
 
 def wait_for_stream(

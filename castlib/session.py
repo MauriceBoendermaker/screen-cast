@@ -63,6 +63,30 @@ class SessionEvent:
     message: str
 
 
+@dataclass(frozen=True)
+class CastStats:
+    """How the cast is going, as of the last look around.
+
+    Everything here is already known to something: ffmpeg reports the
+    encode figures, the playlist weighs its own segments, the device
+    reports its own stalls, and the loopback capture tracks its level
+    for the silence warning. This is that scattered knowledge gathered
+    into one snapshot for anyone who wants to watch it live. The
+    command line ignores it.
+    """
+
+    elapsed: float
+    fps: float
+    speed: float
+    bitrate_kbps: float
+    dropped: int
+    duplicated: int
+    rebuffers: int
+
+    # None when system audio is off, which is not the same as silence.
+    audio_peak_dbfs: float | None
+
+
 @dataclass
 class CastOptions:
     host: str | None = None
@@ -90,6 +114,7 @@ class CastSession:
         self._stopping = threading.Event()
 
         self._state = SessionState.IDLE
+        self._stats: CastStats | None = None
 
     @property
     def state(self) -> SessionState:
@@ -98,6 +123,16 @@ class CastSession:
     @property
     def is_running(self) -> bool:
         return self._state in (SessionState.STARTING, SessionState.CASTING)
+
+    @property
+    def stats(self) -> CastStats | None:
+        """The latest snapshot, or None until a cast is actually running.
+
+        Read from whatever thread likes. The monitor swaps in a whole
+        frozen object rather than editing one in place, so a reader can
+        never catch it half updated and there is nothing to lock.
+        """
+        return self._stats
 
     def _emit(self, state: SessionState, message: str) -> None:
         self._state = state
@@ -110,6 +145,7 @@ class CastSession:
 
             self._stopping.clear()
             self._state = SessionState.STARTING
+            self._stats = None
 
             self._worker = threading.Thread(
                 target=self._run,
@@ -136,6 +172,7 @@ class CastSession:
         server = None
         ffmpeg = None
         capture = None
+        progress = None
 
         try:
             if not streaming.ffmpeg_available():
@@ -185,6 +222,14 @@ class CastSession:
 
             ffmpeg = streaming.start_ffmpeg(settings)
 
+            # Started here rather than when something wants to watch,
+            # and started even for the command line, which never looks:
+            # the pipe holds about eleven seconds of blocks and silently
+            # drops everything after that, so a reader that arrives late
+            # inherits numbers that stopped moving before it existed.
+            progress = streaming.FfmpegProgress()
+            progress.start(ffmpeg.stdout)
+
             if capture is not None:
                 capture.start(ffmpeg.stdin)
 
@@ -219,7 +264,7 @@ class CastSession:
                 )
 
             self._await_playback(cast, options.port, name)
-            self._monitor(ffmpeg, capture, cast, name)
+            self._monitor(ffmpeg, capture, progress, directory, cast, name)
         except Exception as error:
             if not self._stopping.is_set():
                 self._emit(SessionState.FAILED, str(error))
@@ -231,6 +276,7 @@ class CastSession:
                 server=server,
                 ffmpeg=ffmpeg,
                 capture=capture,
+                progress=progress,
                 directory=directory,
             )
 
@@ -412,6 +458,8 @@ class CastSession:
         self,
         ffmpeg: subprocess.Popen,
         capture: LoopbackCapture | None,
+        progress: streaming.FfmpegProgress,
+        directory: Path,
         cast: pychromecast.Chromecast,
         name: str,
     ) -> None:
@@ -446,6 +494,14 @@ class CastSession:
                     "choose a longer Delay or a lower Quality.",
                 )
 
+            self._stats = self._snapshot(
+                elapsed=time.monotonic() - started,
+                progress=progress.latest,
+                bitrate_kbps=streaming.measured_bitrate_kbps(directory),
+                capture=capture,
+                rebuffers=rebuffers,
+            )
+
             if ffmpeg.poll() is not None:
                 raise RuntimeError(
                     f"FFmpeg stopped unexpectedly with exit code "
@@ -465,6 +521,25 @@ class CastSession:
                     self._emit(SessionState.CASTING, complaint)
 
             time.sleep(0.5)
+
+    @staticmethod
+    def _snapshot(
+        elapsed: float,
+        progress: streaming.EncodeProgress,
+        bitrate_kbps: float,
+        capture: LoopbackCapture | None,
+        rebuffers: int,
+    ) -> CastStats:
+        return CastStats(
+            elapsed=elapsed,
+            fps=progress.fps,
+            speed=progress.speed,
+            bitrate_kbps=bitrate_kbps,
+            dropped=progress.dropped,
+            duplicated=progress.duplicated,
+            rebuffers=rebuffers,
+            audio_peak_dbfs=capture.peak_dbfs if capture is not None else None,
+        )
 
     @staticmethod
     def _audio_complaint(capture: LoopbackCapture, name: str) -> str | None:
@@ -497,6 +572,7 @@ class CastSession:
         ffmpeg: subprocess.Popen | None,
         capture: LoopbackCapture | None,
         directory: Path,
+        progress: streaming.FfmpegProgress | None = None,
         disconnect: bool = True,
     ) -> None:
         if self._state is not SessionState.FAILED:
@@ -546,6 +622,11 @@ class CastSession:
                     ffmpeg.wait(timeout=5)
                 except subprocess.TimeoutExpired:
                     ffmpeg.kill()
+
+        # After ffmpeg, not before: the reader is sitting on a read that
+        # only ends when the process exits and closes the pipe.
+        if progress is not None:
+            progress.stop()
 
         if server is not None:
             server.shutdown()

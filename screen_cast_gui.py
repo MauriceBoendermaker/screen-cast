@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import queue
 import sys
 import tempfile
@@ -14,7 +15,13 @@ import pychromecast
 from castlib import audio, discovery, streaming, win98
 from castlib import settings as settings_store
 from castlib.audio import AudioDevice, OutputDevice
-from castlib.session import CastOptions, CastSession, SessionEvent, SessionState
+from castlib.session import (
+    CastOptions,
+    CastSession,
+    CastStats,
+    SessionEvent,
+    SessionState,
+)
 from castlib.win98 import scale
 
 
@@ -22,12 +29,67 @@ TITLE = "Screen Cast"
 WIDTH = 360
 HEIGHT = 328
 
+# The panel opens with the cast, but the monitor that fills it only
+# starts once the device is actually playing — a good ten seconds later,
+# behind the head start. Say so rather than showing three blank lines.
+WAITING_FOR_STATS = ("Waiting for the encoder...", "", "")
+
 MIC_WARNING = "Microphone (picks up the TV)"
 
 # How long Close waits for a tidy shutdown before going anyway. A cast
 # that is still negotiating with the device can otherwise hold the
 # window open for the length of the device's own timeout.
 CLOSE_GRACE = 3.0
+
+
+def format_elapsed(seconds: float) -> str:
+    hours, rest = divmod(int(seconds), 3600)
+    minutes, remainder = divmod(rest, 60)
+
+    if hours:
+        return f"{hours}:{minutes:02d}:{remainder:02d}"
+
+    return f"{minutes}:{remainder:02d}"
+
+
+def plural(count: int, noun: str) -> str:
+    """One dropped frame is not "1 frames"."""
+    return f"{count} {noun}" if count == 1 else f"{count} {noun}s"
+
+
+def format_peak(dbfs: float | None) -> str:
+    """Nothing at all when system audio is off, which is not silence."""
+    if dbfs is None:
+        return ""
+
+    if dbfs == float("-inf"):
+        return "no sound"
+
+    return f"peak {dbfs:.0f} dB"
+
+
+def format_stats(stats: CastStats | None) -> tuple[str, str, str]:
+    """Three lines: how fast it encodes, what it throws away, how it lands."""
+    if stats is None:
+        return WAITING_FOR_STATS
+
+    landing = [
+        format_elapsed(stats.elapsed),
+        plural(stats.rebuffers, "rebuffer"),
+    ]
+
+    peak = format_peak(stats.audio_peak_dbfs)
+
+    if peak:
+        landing.append(peak)
+
+    return (
+        f"{stats.fps:.1f} fps at {stats.speed:.2f}x, "
+        f"{stats.bitrate_kbps / 1000:.1f} Mbps",
+        f"{plural(stats.dropped, 'frame')} dropped, "
+        f"{stats.duplicated} duplicated",
+        ", ".join(landing),
+    )
 
 
 class ScreenCastApp:
@@ -45,6 +107,7 @@ class ScreenCastApp:
         self.outputs: list[OutputDevice] = []
         self.closing = False
         self.destroyed = False
+        self.stats_showing = False
 
         self.window = win98.AppWindow(TITLE, WIDTH, HEIGHT, on_close=self.close)
 
@@ -132,6 +195,18 @@ class ScreenCastApp:
         self.mic_box = win98.Dropdown(group.content, width=300)
         self.mic_box.pack(anchor="w", pady=(scale(3), 0))
 
+        # Built with everything else but left unpacked: there is nothing
+        # to report until a cast is running, and the window is sized for
+        # its absence.
+        self.stats_group = win98.GroupBox(body, "Stats")
+        self.stats_lines: list[tk.Label] = []
+
+        for text in WAITING_FOR_STATS:
+            line = self.window.label(self.stats_group.content, text)
+            line.pack(anchor="w")
+
+            self.stats_lines.append(line)
+
         self.status = win98.StatusField(body, height=36)
         self.status.pack(fill="x", pady=(0, scale(10)))
 
@@ -161,6 +236,44 @@ class ScreenCastApp:
 
         self.start_button.set_enabled(running or bool(self.devices))
         self.start_button.set_text("Stop casting" if running else "Start casting")
+
+    def _stats_height(self) -> int:
+        """Ask the panel how much room it wants, in unscaled units.
+
+        Text height follows the font, which follows the monitor, so a
+        constant that looked right on one screen leaves a band of empty
+        grey — or a Start button pushed off the bottom — on another.
+        """
+        self.stats_group.update_idletasks()
+
+        return math.ceil(
+            (self.stats_group.winfo_reqheight() + scale(8)) / scale()
+        )
+
+    def _show_stats(self, showing: bool) -> None:
+        """Make room first, then fill it — and the reverse going back.
+
+        Packing the panel into a window that has not grown yet squeezes
+        every other control, which reads as a flinch.
+        """
+        if showing == self.stats_showing:
+            return
+
+        self.stats_showing = showing
+
+        if showing:
+            self.window.resize(WIDTH, HEIGHT + self._stats_height())
+            self.stats_group.pack(fill="x", pady=(0, scale(8)), before=self.status)
+        else:
+            self.stats_group.pack_forget()
+            self.window.resize(WIDTH, HEIGHT)
+
+    def _refresh_stats(self) -> None:
+        if not self.stats_showing:
+            return
+
+        for line, text in zip(self.stats_lines, format_stats(self.session.stats)):
+            line.configure(text=text)
 
     # ----------------------------------------------------------- discovery
 
@@ -297,6 +410,7 @@ class ScreenCastApp:
             )
         )
 
+        self._show_stats(True)
         self._update_controls()
 
     def _stop(self) -> None:
@@ -317,9 +431,12 @@ class ScreenCastApp:
             self.status.set_text(event.message)
 
             if event.state in (SessionState.IDLE, SessionState.FAILED):
+                self._show_stats(False)
                 self._update_controls()
             elif event.state is SessionState.CASTING:
                 self._update_controls()
+
+        self._refresh_stats()
 
         if not self.closing:
             self.window.root.after(100, self._drain)

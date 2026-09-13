@@ -970,6 +970,15 @@ class AppWindow:
     def label(self, parent: tk.Misc, text: str) -> tk.Label:
         return tk.Label(parent, text=text, bg=FACE, fg=TEXT, font=ui_font())
 
+    def resize(self, width: int, height: int) -> None:
+        """Change the size without moving the window.
+
+        Geometry given as a size alone leaves the position alone, so a
+        panel appearing does not also teleport the window back to the
+        middle of the screen.
+        """
+        self.root.geometry(f"{scale(width)}x{scale(height)}")
+
     def center(self) -> None:
         self.root.update_idletasks()
 
