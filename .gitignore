@@ -1,0 +1,20 @@
+# Virtual environments
+venv/
+.venv/
+
+# Python bytecode
+__pycache__/
+*.pyc
+
+# IDE / editor state
+.idea/
+.vs/
+.claude/
+
+# Runtime artifacts (screenshots, predictions, caches, logs)
+output/
+logs/
+
+# Images are ignored by default (datasets, screenshots)...
+*.png
+*.jpg
