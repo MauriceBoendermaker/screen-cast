@@ -11,6 +11,7 @@ Depends on nothing else in the package.
 from __future__ import annotations
 
 import ctypes
+import math
 import tkinter as tk
 from tkinter import font as tkfont
 from typing import Callable, Sequence
@@ -723,14 +724,27 @@ class TitleBar(tk.Canvas):
         "###  ###",
         "##    ##",
     )
+    HELP = (
+        " #### ",
+        "##  ##",
+        "##  ##",
+        "    ##",
+        "   ## ",
+        "  ##  ",
+        "      ",
+        "  ##  ",
+    )
+
+    GLYPHS = {"about": HELP, "minimize": MINIMIZE, "close": CLOSE}
 
     def __init__(
         self,
         parent: tk.Misc,
-        window: tk.Tk,
+        window: tk.Tk | tk.Toplevel,
         text: str,
         on_close: Callable[[], None],
         on_minimize: Callable[[], None] | None = None,
+        on_about: Callable[[], None] | None = None,
     ) -> None:
         super().__init__(
             parent,
@@ -743,7 +757,11 @@ class TitleBar(tk.Canvas):
         self._window = window
         self._text = text
         self._on_close = on_close
-        self._on_minimize = on_minimize
+        self._handlers = {
+            "about": on_about,
+            "minimize": on_minimize,
+            "close": on_close,
+        }
         self._active = True
         self._drag: tuple[int, int] | None = None
 
@@ -756,15 +774,30 @@ class TitleBar(tk.Canvas):
         window.bind("<FocusOut>", lambda _event: self._set_active(False), add="+")
 
     def _button_boxes(self) -> dict[str, tuple[int, int, int, int]]:
+        """Where each button that actually exists sits, right to left.
+
+        Close is always there and always flush right; the optional ones
+        crowd up against it, with the era's small gap before close.
+        Absent buttons get no box at all, so the space one would have
+        taken stays draggable instead of swallowing the click into a
+        button nobody can see.
+        """
         width = self.winfo_width() or 1
         size = scale(16)
         top = scale(2)
         right = width - scale(2)
 
-        close = (right - size, top, right, top + size)
-        minimize = (close[0] - size - scale(2), top, close[0] - scale(2), top + size)
+        boxes = {"close": (right - size, top, right, top + size)}
+        edge = right - size - scale(2)
 
-        return {"close": close, "minimize": minimize}
+        for name in ("minimize", "about"):
+            if self._handlers[name] is None:
+                continue
+
+            boxes[name] = (edge - size, top, edge, top + size)
+            edge -= size
+
+        return boxes
 
     def _redraw(self) -> None:
         self.delete("all")
@@ -784,17 +817,12 @@ class TitleBar(tk.Canvas):
             font=ui_font(bold=True),
         )
 
-        boxes = self._button_boxes()
-
-        for name, (x0, y0, x1, y1) in boxes.items():
-            if name == "minimize" and self._on_minimize is None:
-                continue
-
+        for name, (x0, y0, x1, y1) in self._button_boxes().items():
             self.create_rectangle(x0, y0, x1, y1, fill=FACE, outline="")
 
             draw_bevel(self, x0, y0, x1, y1, RAISED)
 
-            glyph = self.CLOSE if name == "close" else self.MINIMIZE
+            glyph = self.GLYPHS[name]
             glyph_width = len(glyph[0]) * scale()
             glyph_height = len(glyph) * scale()
 
@@ -857,10 +885,8 @@ class TitleBar(tk.Canvas):
 
         target = self._hit(event)
 
-        if target == "close":
-            self._on_close()
-        elif target == "minimize" and self._on_minimize is not None:
-            self._on_minimize()
+        if target is not None:
+            self._handlers[target]()
 
     def _set_active(self, active: bool) -> None:
         if active != self._active:
@@ -895,6 +921,79 @@ def show_in_taskbar(window: tk.Tk) -> None:
         pass
 
 
+GWLP_HWNDPARENT = -8
+MONITOR_DEFAULTTONEAREST = 2
+
+
+def own_window(window: tk.Misc, owner: tk.Misc) -> None:
+    """Tell Windows which window this one belongs to.
+
+    Tk sets no owner on an overrideredirect Toplevel: transient() gives
+    it the tool-window style and leaves the owner at zero. A dialog then
+    opens above its parent and stays there right up until anything
+    raises the parent — Alt-Tab back to the app, or its taskbar button —
+    at which point the parent covers a dialog that is still holding the
+    input grab. Nothing responds and nothing is visible to click, which
+    reads as the app having hung.
+
+    Only after the window is on screen: mapping a withdrawn
+    overrideredirect Toplevel destroys and recreates the wrapper it
+    would be set on, taking the owner with it.
+    """
+    try:
+        user32 = ctypes.windll.user32
+
+        set_owner = user32.SetWindowLongPtrW
+        set_owner.argtypes = (ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p)
+        set_owner.restype = ctypes.c_void_p
+
+        handle = user32.GetParent(window.winfo_id()) or window.winfo_id()
+        owned_by = user32.GetParent(owner.winfo_id()) or owner.winfo_id()
+
+        set_owner(handle, GWLP_HWNDPARENT, owned_by)
+    except (AttributeError, OSError):
+        pass
+
+
+class _MonitorInfo(ctypes.Structure):
+    _fields_ = [
+        ("cbSize", ctypes.c_ulong),
+        ("rcMonitor", ctypes.c_long * 4),
+        ("rcWork", ctypes.c_long * 4),
+        ("dwFlags", ctypes.c_ulong),
+    ]
+
+
+def work_area(window: tk.Misc) -> tuple[int, int, int, int]:
+    """The usable part of whichever screen this window is on.
+
+    Tk only knows about the primary monitor, which would drag a window
+    on a second screen back onto the first.
+    """
+    try:
+        user32 = ctypes.windll.user32
+
+        handle = user32.GetParent(window.winfo_id()) or window.winfo_id()
+
+        from_window = user32.MonitorFromWindow
+        from_window.argtypes = (ctypes.c_void_p, ctypes.c_ulong)
+        from_window.restype = ctypes.c_void_p
+
+        info = _MonitorInfo()
+        info.cbSize = ctypes.sizeof(info)
+
+        monitor = from_window(handle, MONITOR_DEFAULTTONEAREST)
+
+        if monitor and user32.GetMonitorInfoW(
+            ctypes.c_void_p(monitor), ctypes.byref(info)
+        ):
+            return tuple(info.rcWork)
+    except (AttributeError, OSError):
+        pass
+
+    return (0, 0, window.winfo_screenwidth(), window.winfo_screenheight())
+
+
 def minimize(window: tk.Tk) -> None:
     """iconify() does nothing on an overrideredirect window, so ask Windows."""
     SW_MINIMIZE = 6
@@ -913,6 +1012,11 @@ class AppWindow:
 
     Native Windows 11 chrome above a silver dialog would undercut the
     whole effect, so the frame is drawn here instead.
+
+    Given a parent it builds a Toplevel rather than a second Tk root,
+    since only one real root belongs to a process, and skips the setup
+    that only makes sense once: the DPI awareness, and the taskbar
+    button, which belongs to the window a dialog opened out of.
     """
 
     def __init__(
@@ -921,16 +1025,30 @@ class AppWindow:
         width: int,
         height: int,
         on_close: Callable[[], None] | None = None,
+        on_about: Callable[[], None] | None = None,
+        parent: tk.Misc | None = None,
     ) -> None:
-        enable_dpi_awareness()
+        self.parent = parent
 
-        self.root = tk.Tk()
-        configure(self.root)
+        if parent is None:
+            enable_dpi_awareness()
+
+            self.root = tk.Tk()
+
+            configure(self.root)
+        else:
+            self.root = tk.Toplevel(parent)
+
+            # Built hidden, sized, placed, then shown — the same order
+            # the Dropdown popup needs, because positioning a frameless
+            # Toplevel before it is mapped does not stick.
+            self.root.withdraw()
 
         self.root.title(title)
         self.root.configure(bg=FACE)
         self.root.overrideredirect(True)
-        self.root.geometry(f"{scale(width)}x{scale(height)}")
+
+        self.resize(width, height)
 
         self._on_close = on_close or self.root.destroy
 
@@ -947,7 +1065,10 @@ class AppWindow:
             self.root,
             title,
             self._on_close,
-            lambda: minimize(self.root),
+            # A dialog has nowhere to minimize to: the taskbar button
+            # belongs to the window it opened out of.
+            on_minimize=None if parent is not None else lambda: minimize(self.root),
+            on_about=on_about,
         )
 
         self.titlebar.pack(fill="x", padx=scale(3), pady=(scale(3), 0))
@@ -977,18 +1098,72 @@ class AppWindow:
         panel appearing does not also teleport the window back to the
         middle of the screen.
         """
-        self.root.geometry(f"{scale(width)}x{scale(height)}")
+        self._size = (scale(width), scale(height))
+
+        self.root.geometry(f"{self._size[0]}x{self._size[1]}")
 
     def center(self) -> None:
+        """Over the parent if there is one, otherwise on the screen.
+
+        Placed from the size it asked to be rather than the size it
+        reports: a window that has not been mapped yet insists it is one
+        pixel tall, and a dialog has to be positioned before it is shown
+        or it is seen in the screen corner first.
+
+        Then kept on the screen whatever the parent is doing. The main
+        window is frameless and drags without constraint, so it can sit
+        far enough into a corner that a dialog centred on it would open
+        entirely off screen — while still holding the input grab, which
+        leaves nothing visible to dismiss and nothing responding.
+        """
         self.root.update_idletasks()
 
-        width = self.root.winfo_width()
-        height = self.root.winfo_height()
+        width, height = self._size
 
-        x = (self.root.winfo_screenwidth() - width) // 2
-        y = (self.root.winfo_screenheight() - height) // 3
+        if self.parent is not None:
+            x = self.parent.winfo_rootx() + (self.parent.winfo_width() - width) // 2
+            y = self.parent.winfo_rooty() + (self.parent.winfo_height() - height) // 2
+        else:
+            x = (self.root.winfo_screenwidth() - width) // 2
+            y = (self.root.winfo_screenheight() - height) // 3
+
+        left, top, right, bottom = work_area(self.parent or self.root)
+
+        x = min(max(x, left), max(left, right - width))
+        y = min(max(y, top), max(top, bottom - height))
 
         self.root.geometry(f"+{x}+{y}")
+
+    def fit(self, width: int) -> None:
+        """Take the height the contents turned out to need.
+
+        Text height follows the font, which follows the monitor, so a
+        dialog pinned to a constant fits on the screen it was written
+        on and clips its own buttons on the next one.
+        """
+        self.root.update_idletasks()
+
+        self.resize(width, math.ceil(self.root.winfo_reqheight() / scale()))
+
+    def show_modal(self) -> None:
+        """Take the parent's input until this window goes away.
+
+        Placed, then shown, then owned — in that order and no other. A
+        transient Toplevel keeps the position it was given, unlike the
+        Dropdown's popup, so mapping first would show it in the screen
+        corner for a frame; but the owner has to be set the other way
+        round, because mapping is what replaces the handle it is set on.
+        """
+        self.center()
+
+        self.root.transient(self.parent)
+        self.root.deiconify()
+
+        own_window(self.root, self.parent)
+
+        self.root.grab_set()
+        self.root.lift()
+        self.root.focus_force()
 
     def run(self) -> None:
         self.center()

@@ -8,7 +8,7 @@ import time
 
 import pychromecast
 
-from castlib import audio, discovery, streaming
+from castlib import __version__, audio, discovery, streaming
 from castlib.audio import AudioDevice
 from castlib.session import CastOptions, CastSession, SessionState
 
@@ -74,6 +74,12 @@ def select_microphone(pattern: str) -> AudioDevice:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Cast the desktop to a Cast device.")
+
+    parser.add_argument(
+        "--version",
+        action="version",
+        version=f"Screen Cast {__version__}",
+    )
 
     parser.add_argument(
         "--host",

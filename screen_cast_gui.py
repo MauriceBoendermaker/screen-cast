@@ -9,10 +9,11 @@ import tempfile
 import threading
 import tkinter as tk
 from pathlib import Path
+from typing import Callable
 
 import pychromecast
 
-from castlib import audio, discovery, streaming, win98
+from castlib import __version__, audio, discovery, streaming, win98
 from castlib import settings as settings_store
 from castlib.audio import AudioDevice, OutputDevice
 from castlib.session import (
@@ -35,6 +36,8 @@ HEIGHT = 328
 WAITING_FOR_STATS = ("Waiting for the encoder...", "", "")
 
 MIC_WARNING = "Microphone (picks up the TV)"
+
+DESCRIPTION = "Casts the Windows desktop, with sound, to a Chromecast."
 
 # How long Close waits for a tidy shutdown before going anyway. A cast
 # that is still negotiating with the device can otherwise hold the
@@ -92,6 +95,89 @@ def format_stats(stats: CastStats | None) -> tuple[str, str, str]:
     )
 
 
+class AboutDialog:
+    """Where the version lives, since the title bar deliberately does not.
+
+    Period-correct Win98 apps put it here rather than in the caption,
+    and it is the one place to answer "was this the build with the fix".
+    """
+
+    WIDTH = 236
+
+    def __init__(
+        self,
+        parent: win98.AppWindow,
+        on_closed: Callable[[], None] | None = None,
+    ) -> None:
+        self._parent = parent
+        self._on_closed = on_closed
+        self._closed = False
+
+        # Height is whatever the four lines of content come to; only the
+        # width is a choice, and it is what the description wraps to.
+        self.window = win98.AppWindow(
+            f"About {TITLE}",
+            self.WIDTH,
+            0,
+            on_close=self.close,
+            parent=parent.root,
+        )
+
+        body = self.window.body
+
+        name = self.window.label(body, TITLE)
+        name.configure(font=win98.ui_font(bold=True))
+        name.pack(anchor="w")
+
+        self.window.label(body, f"Version {__version__}").pack(
+            anchor="w", pady=(scale(2), scale(8))
+        )
+
+        description = self.window.label(body, DESCRIPTION)
+        description.configure(
+            wraplength=scale(self.WIDTH - 26), justify="left"
+        )
+        description.pack(anchor="w")
+
+        win98.Button(body, "Close", self.close, width=64, height=23).pack(
+            anchor="e", pady=(scale(12), 0)
+        )
+
+        # Escape closes it, the way the Dropdown popup's own grab does.
+        self.window.root.bind("<Escape>", lambda _event: self.close())
+
+        # Anything that closes this window from outside Tk must still
+        # come through here. Destroyed behind our back, the caller goes
+        # on believing the dialog is open and never offers it again.
+        self.window.root.protocol("WM_DELETE_WINDOW", self.close)
+
+        self.window.fit(self.WIDTH)
+        self.window.show_modal()
+
+    def close(self) -> None:
+        if self._closed:
+            return
+
+        self._closed = True
+
+        try:
+            self.window.root.grab_release()
+            self.window.root.destroy()
+        except tk.TclError:
+            pass
+
+        # The parent draws its own title bar from Tk's focus, so without
+        # this it stays greyed out as though something else still had
+        # the window.
+        try:
+            self._parent.root.focus_force()
+        except tk.TclError:
+            pass
+
+        if self._on_closed is not None:
+            self._on_closed()
+
+
 class ScreenCastApp:
     def __init__(self) -> None:
         streaming.clean_stale_directories()
@@ -108,12 +194,19 @@ class ScreenCastApp:
         self.closing = False
         self.destroyed = False
         self.stats_showing = False
+        self.about: AboutDialog | None = None
 
-        self.window = win98.AppWindow(TITLE, WIDTH, HEIGHT, on_close=self.close)
+        self.window = win98.AppWindow(
+            TITLE,
+            WIDTH,
+            HEIGHT,
+            on_close=self.close,
+            on_about=self._show_about,
+        )
 
         self._build()
 
-        self.window.root.after(100, self._drain)
+        self._tick = self.window.root.after(100, self._drain)
 
         self._start_discovery()
         self._load_audio_devices()
@@ -236,6 +329,24 @@ class ScreenCastApp:
 
         self.start_button.set_enabled(running or bool(self.devices))
         self.start_button.set_text("Stop casting" if running else "Start casting")
+
+    def _show_about(self) -> None:
+        # The dialog's own grab should make a second one impossible, but
+        # a window this one cannot dismiss is not a failure worth
+        # risking on that. A stale reference to one that went away
+        # without telling us would be worse still: the button would
+        # simply stop working for the rest of the session.
+        if self.about is not None:
+            if self.about.window.root.winfo_exists():
+                self.about.window.root.lift()
+                return
+
+            self.about = None
+
+        self.about = AboutDialog(self.window, on_closed=self._about_closed)
+
+    def _about_closed(self) -> None:
+        self.about = None
 
     def _stats_height(self) -> int:
         """Ask the panel how much room it wants, in unscaled units.
@@ -438,8 +549,9 @@ class ScreenCastApp:
 
         self._refresh_stats()
 
-        if not self.closing:
-            self.window.root.after(100, self._drain)
+        self._tick = (
+            self.window.root.after(100, self._drain) if not self.closing else None
+        )
 
     # ------------------------------------------------------------ lifetime
 
@@ -473,6 +585,16 @@ class ScreenCastApp:
             return
 
         self.destroyed = True
+
+        # A tick still queued against a window that is about to go away
+        # fires into nothing and Tk complains about it afterwards.
+        if self._tick is not None:
+            try:
+                self.window.root.after_cancel(self._tick)
+            except tk.TclError:
+                pass
+
+            self._tick = None
 
         try:
             self.window.root.destroy()
@@ -519,7 +641,10 @@ def selftest() -> int:
     """
     report = Path(tempfile.gettempdir()) / "screencast_selftest.txt"
 
-    lines = [f"frozen         : {getattr(sys, 'frozen', False)}"]
+    lines = [
+        f"version        : {__version__}",
+        f"frozen         : {getattr(sys, 'frozen', False)}",
+    ]
     failures = []
 
     try:

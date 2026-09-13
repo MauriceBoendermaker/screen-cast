@@ -10,6 +10,11 @@ casting**.
 
 `ffmpeg` must be on PATH. Everything else is inside the exe.
 
+The **?** button in the title bar says which version this is —
+`python cast_screen.py --version` answers the same question from a
+terminal. The version comes from one string in `castlib/__init__.py`,
+so the window, the command line and the build cannot disagree.
+
 ## The one thing that will catch you out
 
 Windows loopback capture taps the speaker endpoint **after** its volume
@@ -222,6 +227,7 @@ python cast_screen.py --no-audio               # video only
 python cast_screen.py --mic "Logitech"         # mix in a microphone
 python cast_screen.py --audio-device "Realtek" # capture a chosen endpoint
 python cast_screen.py --list-audio             # show capturable devices
+python cast_screen.py --version                # which build is this
 ```
 
 Discovery falls back to scanning the local `/24` for port 8009, because

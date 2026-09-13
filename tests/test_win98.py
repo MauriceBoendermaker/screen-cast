@@ -6,6 +6,7 @@ import ctypes
 import tkinter as tk
 import unittest
 from ctypes import wintypes
+from types import SimpleNamespace
 
 from castlib import win98
 
@@ -44,6 +45,48 @@ def real_size(window: tk.Misc) -> tuple[int, int]:
     rect = window_rect(window)
 
     return rect.right - rect.left, rect.bottom - rect.top
+
+
+def handle(window: tk.Misc) -> int:
+    user32 = ctypes.windll.user32
+
+    return user32.GetParent(window.winfo_id()) or window.winfo_id()
+
+
+def owner_of(window: tk.Misc) -> int:
+    """Which window Windows thinks this one belongs to.
+
+    Tk will not tell you: transient() on a frameless Toplevel leaves the
+    owner at zero, and nothing in Tk reports it.
+    """
+    GW_OWNER = 4
+
+    get_window = ctypes.windll.user32.GetWindow
+    get_window.argtypes = (ctypes.c_void_p, ctypes.c_uint)
+    get_window.restype = ctypes.c_void_p
+
+    return get_window(handle(window), GW_OWNER) or 0
+
+
+def above(window: tk.Misc, other: tk.Misc) -> bool:
+    """Is this window in front of that one?"""
+    user32 = ctypes.windll.user32
+
+    get_next = user32.GetWindow
+    get_next.argtypes = (ctypes.c_void_p, ctypes.c_uint)
+    get_next.restype = ctypes.c_void_p
+
+    GW_HWNDNEXT = 2
+    target = handle(other)
+    walker = handle(window)
+
+    while walker:
+        walker = get_next(walker, GW_HWNDNEXT)
+
+        if walker == target:
+            return True
+
+    return False
 
 
 class DropdownPopup(unittest.TestCase):
@@ -215,6 +258,241 @@ class WindowResizing(unittest.TestCase):
         pump(self.window.root)
 
         self.assertGreater(self.window.body.winfo_height(), before)
+
+
+class TitleBarButtons(unittest.TestCase):
+    """Three optional glyph buttons, and the space an absent one leaves."""
+
+    def setUp(self) -> None:
+        self.fired: list[str] = []
+
+        self.window = win98.AppWindow(
+            "Buttons",
+            300,
+            200,
+            on_close=lambda: self.fired.append("close"),
+            on_about=lambda: self.fired.append("about"),
+        )
+
+        pump(self.window.root)
+
+        self.bar = self.window.titlebar
+
+    def tearDown(self) -> None:
+        self.window.root.destroy()
+
+    def centre_of(self, name: str) -> SimpleNamespace:
+        x0, y0, x1, y1 = self.bar._button_boxes()[name]
+
+        return SimpleNamespace(x=(x0 + x1) // 2, y=(y0 + y1) // 2)
+
+    def click(self, name: str) -> None:
+        where = self.centre_of(name)
+
+        self.bar.event_generate("<Button-1>", x=where.x, y=where.y)
+        self.bar.event_generate("<ButtonRelease-1>", x=where.x, y=where.y)
+
+        pump(self.window.root)
+
+    def test_the_main_window_offers_all_three(self) -> None:
+        self.assertEqual(
+            set(self.bar._button_boxes()), {"close", "minimize", "about"}
+        )
+
+    def test_close_stays_flush_right(self) -> None:
+        boxes = self.bar._button_boxes()
+
+        self.assertEqual(
+            boxes["close"][0], max(box[0] for box in boxes.values())
+        )
+
+    def test_help_sits_outside_minimize(self) -> None:
+        boxes = self.bar._button_boxes()
+
+        self.assertLess(boxes["about"][0], boxes["minimize"][0])
+
+    def test_none_of_them_overlap(self) -> None:
+        boxes = sorted(self.bar._button_boxes().values())
+
+        for left, right in zip(boxes, boxes[1:]):
+            self.assertLessEqual(left[2], right[0], f"{left} runs into {right}")
+
+    def test_the_help_button_runs_its_callback(self) -> None:
+        self.click("about")
+
+        self.assertEqual(self.fired, ["about"])
+
+    def test_the_close_button_still_runs_its_own(self) -> None:
+        self.click("close")
+
+        self.assertEqual(self.fired, ["close"])
+
+    def test_a_window_given_no_about_has_no_third_button(self) -> None:
+        self.bar._handlers["about"] = None
+
+        self.assertNotIn("about", self.bar._button_boxes())
+
+    def test_the_space_an_absent_button_would_take_stays_draggable(self) -> None:
+        """A button that is not drawn but still answers _hit swallows
+        the click, leaving a dead strip the window cannot be dragged by
+        and no visible reason why."""
+        where = self.centre_of("about")
+
+        self.bar._handlers["about"] = None
+
+        self.assertIsNone(self.bar._hit(where))
+
+    def test_every_glyph_has_a_button_and_the_reverse(self) -> None:
+        self.assertEqual(set(self.bar.GLYPHS), set(self.bar._handlers))
+
+
+class DialogWindows(unittest.TestCase):
+    """A second window is a Toplevel, not a second Tk root."""
+
+    def setUp(self) -> None:
+        self.main = win98.AppWindow("Main", 300, 200)
+        self.main.root.geometry("+200+150")
+
+        pump(self.main.root)
+
+        self.dialog = win98.AppWindow("Dialog", 200, 100, parent=self.main.root)
+
+        pump(self.main.root)
+
+    def tearDown(self) -> None:
+        self.main.root.destroy()
+
+    def test_a_parent_gives_a_toplevel(self) -> None:
+        """Only one real root belongs to a process."""
+        self.assertIsInstance(self.dialog.root, tk.Toplevel)
+        self.assertNotIsInstance(self.dialog.root, tk.Tk)
+
+    def test_a_dialog_has_nowhere_to_minimize_to(self) -> None:
+        self.assertNotIn("minimize", self.dialog.titlebar._button_boxes())
+        self.assertIn("minimize", self.main.titlebar._button_boxes())
+
+    def test_it_stays_hidden_until_it_is_shown(self) -> None:
+        """Positioning a frameless Toplevel before it is mapped does
+        not stick, so it is built out of sight first."""
+        self.assertEqual(self.dialog.root.state(), "withdrawn")
+
+    def test_showing_it_takes_the_grab(self) -> None:
+        self.dialog.show_modal()
+
+        pump(self.main.root)
+
+        self.assertEqual(
+            str(self.main.root.grab_current()), str(self.dialog.root)
+        )
+
+    def test_it_centres_over_its_parent_rather_than_the_screen(self) -> None:
+        self.dialog.show_modal()
+
+        pump(self.main.root)
+
+        parent, parent_size = real_position(self.main.root), real_size(self.main.root)
+        child, child_size = real_position(self.dialog.root), real_size(self.dialog.root)
+
+        self.assertAlmostEqual(
+            child[0] + child_size[0] // 2,
+            parent[0] + parent_size[0] // 2,
+            delta=2,
+        )
+        self.assertAlmostEqual(
+            child[1] + child_size[1] // 2,
+            parent[1] + parent_size[1] // 2,
+            delta=2,
+        )
+
+    def test_windows_is_told_who_the_dialog_belongs_to(self) -> None:
+        """transient() alone leaves the owner at zero, and an unowned
+        modal sinks behind its parent the moment anything raises it —
+        still grabbing, with nothing visible to dismiss."""
+        self.dialog.show_modal()
+
+        pump(self.main.root)
+
+        self.assertEqual(owner_of(self.dialog.root), handle(self.main.root))
+
+    def test_it_stays_in_front_when_the_parent_is_raised(self) -> None:
+        self.dialog.show_modal()
+
+        pump(self.main.root)
+
+        ctypes.windll.user32.BringWindowToTop(handle(self.main.root))
+
+        pump(self.main.root)
+
+        self.assertTrue(
+            above(self.dialog.root, self.main.root),
+            "the parent covered its own modal dialog",
+        )
+
+    def test_it_stays_on_screen_when_the_parent_is_in_a_corner(self) -> None:
+        """The main window is frameless and drags without constraint,
+        so it can sit somewhere a dialog centred on it would open right
+        off the edge — while holding every click."""
+        left, top, right, bottom = win98.work_area(self.main.root)
+
+        self.main.root.geometry(f"+{right - win98.scale(40)}+{bottom - win98.scale(40)}")
+
+        pump(self.main.root)
+
+        self.dialog.show_modal()
+
+        pump(self.main.root)
+
+        x, y = real_position(self.dialog.root)
+        width, height = real_size(self.dialog.root)
+
+        self.assertGreaterEqual(x, left)
+        self.assertGreaterEqual(y, top)
+        self.assertLessEqual(x + width, right)
+        self.assertLessEqual(y + height, bottom)
+
+    def test_it_is_placed_before_it_is_ever_shown(self) -> None:
+        """Mapped first and positioned after, it is genuinely on screen
+        in the corner for an event loop pass before it jumps to where it
+        belongs — Tk maps a frameless Toplevel the moment anything asks
+        it to settle, which centring does."""
+        visible: list[bool] = []
+        original = win98.AppWindow.center
+
+        def watched(window: win98.AppWindow) -> None:
+            visible.append(
+                bool(ctypes.windll.user32.IsWindowVisible(handle(window.root)))
+            )
+
+            original(window)
+
+        win98.AppWindow.center = watched
+
+        try:
+            self.dialog.show_modal()
+
+            pump(self.main.root)
+        finally:
+            win98.AppWindow.center = original
+
+        self.assertEqual(
+            visible, [False], "the dialog was on screen before it was placed"
+        )
+
+    def test_fit_takes_the_height_the_contents_need(self) -> None:
+        """A dialog pinned to a constant clips its own buttons on a
+        screen whose font comes out taller."""
+        for index in range(6):
+            self.dialog.label(self.dialog.body, f"Line {index}").pack(anchor="w")
+
+        self.dialog.fit(200)
+        self.dialog.show_modal()
+
+        pump(self.main.root)
+
+        _, height = real_size(self.dialog.root)
+
+        self.assertGreater(height, win98.scale(100), "did not grow at all")
+        self.assertGreaterEqual(height, self.dialog.root.winfo_reqheight())
 
 
 class Scaling(unittest.TestCase):

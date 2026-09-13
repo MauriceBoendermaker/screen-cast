@@ -13,6 +13,7 @@ import sys
 import tempfile
 from pathlib import Path
 
+from castlib import __version__
 from make_icon import write_icon
 
 
@@ -106,6 +107,7 @@ def main() -> None:
 
     icon = write_icon(ROOT / "screencast.ico")
 
+    print(f"version : {__version__}")
     print(f"icon    : {icon.name}")
     print(f"python  : {sys.executable}")
     print(f"ffmpeg  : {shutil.which('ffmpeg') or 'NOT FOUND (needed at run time)'}\n")
@@ -116,7 +118,7 @@ def main() -> None:
 
     size = executable.stat().st_size / (1024 * 1024)
 
-    print(f"\nBuilt {executable}  ({size:.1f} MB)")
+    print(f"\nBuilt {executable}  {__version__}  ({size:.1f} MB)")
     print("Double-click it, or pin it to the taskbar.")
 
 
