@@ -2,7 +2,7 @@
 
 
 a = Analysis(
-    ['C:/Users/mauri/Documents/python/screen-cast/screen_cast_gui.py'],
+    ['C:/xampp/htdocs/MauriceB/screen-cast/screen_cast_gui.py'],
     pathex=[],
     binaries=[],
     datas=[],
@@ -35,5 +35,5 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
-    icon=['C:/Users/mauri/Documents/python/screen-cast/screencast.ico'],
+    icon=['C:/xampp/htdocs/MauriceB/screen-cast/screencast.ico'],
 )
