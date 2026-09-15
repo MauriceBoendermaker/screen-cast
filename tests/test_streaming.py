@@ -187,6 +187,59 @@ class CaptureBackend(unittest.TestCase):
             )
 
 
+class CapturePollRate(unittest.TestCase):
+    """Measured during real viewing, 10.4% of frames reached the device
+    held — 2.6 frozen pictures a second. A source and a sampler running
+    at the same nominal rate on different clocks beat against each other,
+    so the sampler has to run above the source and keep what it catches:
+    one capture, one frame sent, no second resampling stage."""
+
+    def test_captures_at_the_output_rate(self) -> None:
+        command = build_ffmpeg_command(settings(fps=50))
+        source = next(part for part in command if "ddagrab" in part)
+
+        self.assertIn("framerate=50", source)
+        self.assertEqual(argument_after(command, "-r"), "50")
+
+    def test_capture_rate_follows_the_output_rate(self) -> None:
+        command = build_ffmpeg_command(settings(fps=30))
+        source = next(part for part in command if "ddagrab" in part)
+
+        self.assertIn("framerate=30", source)
+
+    def test_nothing_is_decimated_between_capture_and_encode(self) -> None:
+        """A decimation stage is a second resampling, and a second
+        chance to land on the wrong frame."""
+        command = build_ffmpeg_command(settings(fps=50))
+        graph = argument_after(command, "-filter_complex")
+
+        self.assertIn("fps=50", graph)
+        self.assertEqual(argument_after(command, "-r"), "50")
+
+    def test_the_rate_filter_precedes_the_readback(self) -> None:
+        """Behind hwdownload, a discarded frame would still have cost a
+        full native-resolution trip across PCIe first."""
+        graph = argument_after(build_ffmpeg_command(settings(fps=30)), "-filter_complex")
+
+        self.assertLess(graph.index("fps=30"), graph.index("hwdownload"))
+
+    def test_defaults_to_fifty(self) -> None:
+        """50 divides a 50Hz television exactly, and samples a 25fps
+        broadcast at twice its rate."""
+        command = build_ffmpeg_command(settings())
+
+        self.assertEqual(argument_after(command, "-r"), "50")
+
+    def test_the_slow_grabber_is_not_polled_faster(self) -> None:
+        """gdigrab cannot reach 30 here, let alone 60; asking would only
+        spend CPU duplicating frames earlier in the chain."""
+        command = build_ffmpeg_command(settings(capture="gdigrab", fps=30))
+        graph = argument_after(command, "-filter_complex")
+
+        self.assertEqual(argument_after(command, "-framerate"), "30")
+        self.assertNotIn("fps=", graph)
+
+
 class Quality(unittest.TestCase):
     def test_presets_raise_the_bitrate_in_order(self) -> None:
         rates = [

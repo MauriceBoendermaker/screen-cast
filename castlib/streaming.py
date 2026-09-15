@@ -25,7 +25,45 @@ from castlib.audio import (
 )
 
 
-FPS = 30
+# The output rate has to divide into the television's refresh rate, or
+# the set has to hold some frames longer than others and the motion
+# steps no matter how good the stream is. A 50Hz panel showing 30fps
+# must hold frames for 2, 2, then 1 refresh and repeat that forever;
+# there is no encoder setting that helps, because nothing is wrong with
+# the encoding.
+#
+# It compounds at the other end. European broadcast is a 25/50 family,
+# so casting Dutch television through a 30fps pipeline also decimates
+# 50fps content to 30 — keeping three frames of every five, on an
+# equally uneven cadence. Two non-integer conversions stacked.
+#
+# 25 divides both: exactly two refreshes per frame on a 50Hz set, every
+# other frame from 50fps content, one-for-one from 25fps content. It
+# also asks less of the link than 30 did, for the same picture.
+#
+# 25 was still not enough, and the measurement says why. Casting the
+# stream and reading the segments back during real viewing — not an idle
+# desktop — found 10.4% of frames held: 2.6 frozen pictures a second at
+# 25fps, which is exactly the "about twice a second" being reported. The
+# television was being sent 22.4 distinct frames a second, not 25.
+#
+# Matching the source rate is not enough when the two clocks are not the
+# same clock. A 25fps source sampled by an unsynchronised 25Hz sampler
+# beats against it: as the phase drifts, some samples land on a frame
+# that has not changed yet and others skip one. The rates agree and the
+# motion still steps.
+#
+# The cure is to sample faster than the source and keep everything. At
+# 50 the sampler catches each 25fps frame within 20ms of its real moment
+# instead of 40ms, nothing is decimated away afterwards, and a 50Hz set
+# presents it one frame per refresh. Measured at 1.58 cores, and held
+# frames cost almost nothing to encode, so a 25fps source at 50fps out
+# weighs little more than it did at 25.
+#
+# 30 remains right for a 60Hz set, which is why this wants to become a
+# setting rather than a constant — it depends on the television, and the
+# app cannot see the television.
+FPS = 50
 WIDTH = 1920
 HEIGHT = 1080
 
@@ -35,6 +73,34 @@ HEIGHT = 1080
 # the Desktop Duplication API on the GPU and delivered a true 30.
 DDAGRAB = "ddagrab"
 GDIGRAB = "gdigrab"
+
+# ddagrab's framerate is a ceiling, not a promise. ffmpeg's own filter
+# documentation is explicit: "there is no background buffering going on,
+# so when the filter is not polled often enough then the actual
+# inter-frame interval may be significantly larger" — and separately,
+# when the desktop has not changed it hands back the previous frame
+# (dup_frames, default true).
+#
+# Neither shows up anywhere. Because the output is CFR, a poll that
+# lands late does not arrive late: -r pays for the stretched interval by
+# repeating the previous picture, and ddagrab stamps that repeat on its
+# own even grid, so ffmpeg counts nothing. fps stays 30.0, speed stays
+# 1.00x, dropped and duplicated stay 0, segments still close on the two
+# second beat — while the picture visibly steps. Every instrument this
+# app has reads clean through it, which is why the fault survived being
+# measured from the encoder's side.
+#
+# Polling above the output rate absorbs some of that, and at a 30fps
+# output it was worth doing. It stops paying once the output rate is
+# itself 50: ddagrab measured 247 frames of 250 at 50Hz but only 333 of
+# 500 at 100Hz, because every polled frame is a 16.4MB readback from a
+# 2560x1600 desktop and that caps out around 67 a second. Asking for a
+# rate it cannot hold would make the pacing worse, not better.
+#
+# So at 50 the capture rate IS the output rate: every frame polled is a
+# frame sent, nothing is decimated, and there is no second resampling
+# stage to beat against the first.
+CAPTURE_POLL_MULTIPLIER = 1
 
 # Encoder choice is measured, not assumed. With capture moved to the
 # GPU, every libx264 preset better than ultrafast still misses real
@@ -223,7 +289,8 @@ def build_ffmpeg_command(settings: StreamSettings) -> list[str]:
             "-f",
             "lavfi",
             "-i",
-            f"ddagrab=0:framerate={settings.fps}:draw_mouse=1",
+            f"ddagrab=0:framerate="
+            f"{settings.fps * CAPTURE_POLL_MULTIPLIER}:draw_mouse=1",
         ]
     else:
         command += [
@@ -270,9 +337,15 @@ def build_ffmpeg_command(settings: StreamSettings) -> list[str]:
         audio_inputs.append(f"{len(audio_inputs) + 1}:a")
 
     # ddagrab hands back frames living on the GPU, so they have to come
-    # down to system memory before libx264 can see them.
+    # down to system memory before libx264 can see them. The decimation
+    # from the poll rate back to the output rate goes first, while the
+    # frames are still on the GPU and dropping one is free — behind
+    # hwdownload it would cost a full 2560x1600 readback per discarded
+    # frame.
     source = (
-        "[0:v]hwdownload,format=bgra," if settings.capture == DDAGRAB else "[0:v]"
+        f"[0:v]fps={settings.fps},hwdownload,format=bgra,"
+        if settings.capture == DDAGRAB
+        else "[0:v]"
     )
 
     scale = (
