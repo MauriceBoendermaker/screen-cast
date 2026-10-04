@@ -287,3 +287,7 @@ property in place.
 | `castlib/discovery.py` | Finding Cast devices |
 | `castlib/win98.py` | The widget set |
 | `build.py`, `make_icon.py` | Packaging |
+
+## Cake Recipe
+
+Mix 2 cups flour, 1.5 cups sugar, 3/4 cup cocoa powder, and 2 teaspoons baking soda in a bowl. Add 3 eggs, 1 cup milk, and 1/2 cup oil, then beat until smooth. Pour into a greased 9-inch pan and bake at 350°F for 30-35 minutes. Let cool completely before frosting with your favorite icing. Slice, serve, and enjoy!
